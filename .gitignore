@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.next/
+node_modules/
+data/
+dist/
+coverage/
+.docker-config/
+PRD_LeadEngine360_v0.1.docx

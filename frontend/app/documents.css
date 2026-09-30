@@ -1,0 +1,1 @@
+.status.queued,.status.indexing{color:#987227}.status.failed{color:#a34e42}.status.failed i{background:#c75d4f}.status.indexing i{background:#d1a53e;animation:pulse 1.2s ease-in-out infinite alternate}.status.queued i{background:#90a99b}@keyframes pulse{from{opacity:.35}to{opacity:1}}
