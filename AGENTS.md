@@ -155,3 +155,11 @@ Avaliar o LeadEngine360 de ponta a ponta e entregar evidências do que funciona,
 - Apollo respondeu HTTP 403: o endpoint Organization Search usado pela integração não está disponível no plano Free; a própria resposta informa que requer plano pago. Nenhum resultado Apollo foi obtido.
 - O teste valida as credenciais locais e a chamada direta ao Hunter, mas não valida o worker, a aplicação implantada, o armazenamento de leads ou as variáveis na Innovaapps. Não foi feita busca de contatos via Hunter Domain Search.
 - Nenhum arquivo de implementação, dado de negócio, container ou deploy foi alterado nesta interação; este registro foi atualizado.
+### 2026-10-06 — commit e push das mudanças do MVP
+
+**Usuário:** “Vamos fazer um commit e um push”.
+
+- Revisado o conteúdo staged; nenhum valor de chave foi incluído. Logs de `.playwright-cli/` e relatórios temporários de `output/` foram deixados fora do commit.
+- Criado o commit `84c5d10` (`Implement MVP discovery and workflows`) na branch `main` e enviado com sucesso para `origin/main`.
+- A branch ficou sincronizada após o push. Permanecem arquivos locais não rastreados em `.playwright-cli/` e `output/`; foram preservados e não enviados.
+- Nenhum teste foi executado nesta interação.
