@@ -1,26 +1,30 @@
 from contextlib import asynccontextmanager
+from datetime import timedelta, timezone
+import hashlib
 from pathlib import Path
+import secrets
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from redis import Redis
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
 from .ai import generate_profile
+from .ai_audit import record_ai_calls
 from .config import settings
-from .database import Base, engine, get_db
+from .database import get_db
 from .knowledge import SUPPORTED, retrieve
 from .integrations import router as integrations_router
 from .leads import calculate_score, router as leads_router
-from .models import DocumentChunk, IcpProfile, JobRun, KnowledgeDocument, Offer, SellerCompany, TargetAccount, Tenant, User, utcnow
-from .schemas import IcpUpdateIn, LoginIn, OfferIn, OnboardingIn, ProfileOut, RegisterIn
-from .security import create_token, current_user, hash_password, verify_password
+from .models import AiCall, DocumentChunk, IcpProfile, JobRun, KnowledgeDocument, Offer, SellerCompany, TargetAccount, Tenant, User, UserInvitation, utcnow
+from .schemas import AcceptInvitationIn, IcpUpdateIn, InvitationIn, LoginIn, OfferIn, OnboardingIn, ProfileOut, RegisterIn, RoleUpdateIn
+from .security import create_token, current_user, hash_password, require_roles, verify_password
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    Base.metadata.create_all(bind=engine)
     Path(settings.upload_dir).mkdir(parents=True, exist_ok=True)
     yield
 
@@ -32,8 +36,17 @@ app.include_router(integrations_router)
 
 
 @app.get("/health")
-def health():
-    return {"status": "ok", "service": "leadengine360-api"}
+def health(db: Session = Depends(get_db)):
+    try:
+        db.execute(select(1))
+        queue = Redis.from_url(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
+        try:
+            queue.ping()
+        finally:
+            queue.close()
+    except Exception:
+        raise HTTPException(status_code=503, detail="Banco ou fila indisponível") from None
+    return {"status": "ok", "service": "leadengine360-api", "database": "ok", "queue": "ok"}
 
 
 @app.post("/api/v1/auth/register", status_code=201)
@@ -59,11 +72,71 @@ def login(payload: LoginIn, db: Session = Depends(get_db)):
     return {"access_token": create_token(user), "token_type": "bearer", "tenant_id": user.tenant_id, "email": user.email}
 
 
+@app.post("/api/v1/users/invitations", status_code=201)
+def invite_user(payload: InvitationIn, db: Session = Depends(get_db), user: User = Depends(require_roles("admin"))):
+    email = str(payload.email).lower()
+    if db.scalar(select(User.id).where(User.email == email)):
+        raise HTTPException(status_code=409, detail="Este e-mail já possui uma conta")
+    pending = db.scalars(select(UserInvitation).where(
+        UserInvitation.tenant_id == user.tenant_id, UserInvitation.email == email,
+        UserInvitation.accepted_at.is_(None),
+    )).all()
+    for old in pending:
+        old.expires_at = utcnow()
+    token = secrets.token_urlsafe(32)
+    invitation = UserInvitation(
+        tenant_id=user.tenant_id, email=email, role=payload.role,
+        token_hash=hashlib.sha256(token.encode()).hexdigest(), created_by=user.id,
+        expires_at=utcnow() + timedelta(days=7),
+    )
+    db.add(invitation)
+    db.commit()
+    return {"id": invitation.id, "email": email, "role": invitation.role, "token": token, "expires_at": invitation.expires_at}
+
+
+@app.post("/api/v1/auth/accept-invitation", status_code=201)
+def accept_invitation(payload: AcceptInvitationIn, db: Session = Depends(get_db)):
+    token_hash = hashlib.sha256(payload.token.encode()).hexdigest()
+    invitation = db.scalar(select(UserInvitation).where(UserInvitation.token_hash == token_hash))
+    if invitation is None or invitation.accepted_at is not None:
+        raise HTTPException(status_code=410, detail="Convite inválido ou já utilizado")
+    expiry = invitation.expires_at.replace(tzinfo=timezone.utc) if invitation.expires_at.tzinfo is None else invitation.expires_at
+    if expiry <= utcnow():
+        raise HTTPException(status_code=410, detail="Convite expirado")
+    if db.scalar(select(User.id).where(User.email == invitation.email)):
+        raise HTTPException(status_code=409, detail="Este e-mail já possui uma conta")
+    invited = User(tenant_id=invitation.tenant_id, email=invitation.email, password_hash=hash_password(payload.password), role=invitation.role)
+    db.add(invited)
+    invitation.accepted_at = utcnow()
+    db.commit()
+    return {"access_token": create_token(invited), "token_type": "bearer", "tenant_id": invited.tenant_id, "email": invited.email, "role": invited.role}
+
+
+@app.get("/api/v1/users")
+def list_users(db: Session = Depends(get_db), user: User = Depends(require_roles("admin"))):
+    users = db.scalars(select(User).where(User.tenant_id == user.tenant_id).order_by(User.email)).all()
+    return [{"id": item.id, "email": item.email, "role": item.role} for item in users]
+
+
+@app.patch("/api/v1/users/{user_id}/role")
+def change_user_role(user_id: str, payload: RoleUpdateIn, db: Session = Depends(get_db), user: User = Depends(require_roles("admin"))):
+    target = db.scalar(select(User).where(User.id == user_id, User.tenant_id == user.tenant_id))
+    if target is None:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    if target.role == "admin" and payload.role != "admin":
+        another_admin = db.scalar(select(User.id).where(User.tenant_id == user.tenant_id, User.role == "admin", User.id != target.id))
+        if another_admin is None:
+            raise HTTPException(status_code=409, detail="O tenant precisa manter ao menos um administrador")
+    target.role = payload.role
+    db.commit()
+    return {"id": target.id, "email": target.email, "role": target.role}
+
+
 @app.get("/api/v1/me")
 def me(user: User = Depends(current_user), db: Session = Depends(get_db)):
     tenant = db.get(Tenant, user.tenant_id)
     company = db.scalar(select(SellerCompany).where(SellerCompany.tenant_id == user.tenant_id).options(joinedload(SellerCompany.offers)))
-    return {"tenant_id": user.tenant_id, "tenant_name": tenant.name, "email": user.email, "company": _company_payload(company) if company else None}
+    return {"tenant_id": user.tenant_id, "tenant_name": tenant.name, "email": user.email, "role": user.role, "company": _company_payload(company) if company else None}
 
 
 def _company_payload(company: SellerCompany) -> dict:
@@ -71,8 +144,12 @@ def _company_payload(company: SellerCompany) -> dict:
 
 
 @app.put("/api/v1/onboarding")
-def save_onboarding(payload: OnboardingIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
+def save_onboarding(payload: OnboardingIn, db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "manager"))):
     company = db.scalar(select(SellerCompany).where(SellerCompany.tenant_id == user.tenant_id).options(joinedload(SellerCompany.offers)))
+    company_changed = company is not None and any((getattr(company, field) or None) != (value or None) for field, value in {
+        "name": payload.company_name.strip(), "website": payload.website,
+        "description": payload.company_description, "sales_regions": payload.sales_regions,
+    }.items())
     if company is None:
         company = SellerCompany(tenant_id=user.tenant_id, name=payload.company_name.strip())
         db.add(company)
@@ -81,8 +158,19 @@ def save_onboarding(payload: OnboardingIn, db: Session = Depends(get_db), user: 
     company.website = payload.website
     company.description = payload.company_description
     company.sales_regions = payload.sales_regions
+    if company_changed:
+        profiles = db.scalars(select(IcpProfile).where(IcpProfile.tenant_id == user.tenant_id)).all()
+        for profile in profiles:
+            if profile.status == "approved":
+                profile.status = "draft"
     existing = {offer.id: offer for offer in company.offers}
-    received_ids: set[str] = set()
+    submitted_ids = [item.id for item in payload.offers if item.id]
+    if len(submitted_ids) != len(set(submitted_ids)):
+        raise HTTPException(status_code=422, detail="A lista contém ofertas repetidas")
+    if any(offer_id not in existing for offer_id in submitted_ids):
+        raise HTTPException(status_code=422, detail="Oferta informada não pertence a esta empresa")
+    if len(existing) + sum(item.id is None for item in payload.offers) > 5:
+        raise HTTPException(status_code=422, detail="O limite é de cinco ofertas por empresa")
     for offer_data in payload.offers:
         data = offer_data.model_dump()
         offer_id = data.pop("id", None)
@@ -91,9 +179,13 @@ def save_onboarding(payload: OnboardingIn, db: Session = Depends(get_db), user: 
             offer = Offer(tenant_id=user.tenant_id, company_id=company.id, **data)
             db.add(offer)
         else:
+            changed = any(getattr(offer, key) != value for key, value in data.items())
             for key, value in data.items():
                 setattr(offer, key, value)
-        received_ids.add(offer.id)
+            if changed:
+                icp = db.scalar(select(IcpProfile).where(IcpProfile.tenant_id == user.tenant_id, IcpProfile.offer_id == offer.id))
+                if icp and icp.status == "approved":
+                    icp.status = "draft"
     db.commit()
     saved_company = db.scalar(select(SellerCompany).where(SellerCompany.id == company.id).options(joinedload(SellerCompany.offers)).execution_options(populate_existing=True))
     return _company_payload(saved_company)
@@ -106,7 +198,7 @@ def get_onboarding(db: Session = Depends(get_db), user: User = Depends(current_u
 
 
 @app.post("/api/v1/offers/{offer_id}/documents", status_code=201)
-async def upload_document(offer_id: str, file: UploadFile = File(...), db: Session = Depends(get_db), user: User = Depends(current_user)):
+async def upload_document(offer_id: str, file: UploadFile = File(...), db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "manager", "analyst"))):
     offer = db.scalar(select(Offer).where(Offer.id == offer_id, Offer.tenant_id == user.tenant_id))
     if offer is None:
         raise HTTPException(status_code=404, detail="Oferta não encontrada")
@@ -161,7 +253,7 @@ def get_job(job_id: str, db: Session = Depends(get_db), user: User = Depends(cur
 
 
 @app.post("/api/v1/offers/{offer_id}/profile", response_model=ProfileOut)
-async def create_profile(offer_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
+async def create_profile(offer_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "manager", "analyst"))):
     offer = db.scalar(select(Offer).where(Offer.id == offer_id, Offer.tenant_id == user.tenant_id))
     if offer is None:
         raise HTTPException(status_code=404, detail="Oferta não encontrada")
@@ -174,7 +266,8 @@ async def create_profile(offer_id: str, db: Session = Depends(get_db), user: Use
     rows = db.execute(select(DocumentChunk.id, KnowledgeDocument.filename, DocumentChunk.content).join(KnowledgeDocument, KnowledgeDocument.id == DocumentChunk.document_id).where(DocumentChunk.tenant_id == user.tenant_id, DocumentChunk.offer_id == offer.id, KnowledgeDocument.tenant_id == user.tenant_id)).all()
     query = " ".join([offer.name, offer.description, offer.problem_solved or "", offer.differentiators or "", offer.target_customer_hint or ""])
     evidence = retrieve(query, [(row.id, row.filename, row.content) for row in rows])
-    profile, model = await generate_profile({"name": company.name, "website": company.website, "description": company.description, "sales_regions": company.sales_regions}, {"name": offer.name, "category": offer.category, "description": offer.description, "problem_solved": offer.problem_solved, "differentiators": offer.differentiators, "target_customer_hint": offer.target_customer_hint, "restrictions": offer.restrictions}, evidence)
+    trace: list[dict] = []
+    profile, model = await generate_profile({"name": company.name, "website": company.website, "description": company.description, "sales_regions": company.sales_regions}, {"name": offer.name, "category": offer.category, "description": offer.description, "problem_solved": offer.problem_solved, "differentiators": offer.differentiators, "target_customer_hint": offer.target_customer_hint, "restrictions": offer.restrictions}, evidence, trace)
     icp = db.scalar(select(IcpProfile).where(IcpProfile.tenant_id == user.tenant_id, IcpProfile.offer_id == offer.id))
     if icp is None:
         icp = IcpProfile(tenant_id=user.tenant_id, offer_id=offer.id, version=0)
@@ -184,6 +277,7 @@ async def create_profile(offer_id: str, db: Session = Depends(get_db), user: Use
     icp.generated_with = model
     icp.status = "draft"
     icp.version = (icp.version or 0) + 1
+    record_ai_calls(db, user.tenant_id, offer.id, "generate_profile", trace)
     db.commit()
     return {"offer_id": offer.id, "generated_with": model, "profile": profile, "evidence": [{"chunk_id": row["chunk_id"], "filename": row["filename"], "content": row["content"], "relevance": row["relevance"]} for row in evidence]}
 
@@ -196,11 +290,24 @@ def get_icp(offer_id: str, db: Session = Depends(get_db), user: User = Depends(c
     return {"id": icp.id, "offer_id": icp.offer_id, "profile": icp.profile_json, "evidence": icp.evidence_json, "status": icp.status, "generated_with": icp.generated_with, "version": icp.version, "updated_at": icp.updated_at}
 
 
-@app.put("/api/v1/offers/{offer_id}/icp")
-def update_icp(offer_id: str, payload: IcpUpdateIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
+@app.get("/api/v1/offers/{offer_id}/ai-calls")
+def list_ai_calls(offer_id: str, limit: int = Query(default=50, ge=1, le=200), db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "manager", "analyst"))):
     offer = db.scalar(select(Offer).where(Offer.id == offer_id, Offer.tenant_id == user.tenant_id))
     if offer is None:
         raise HTTPException(status_code=404, detail="Oferta não encontrada")
+    calls = db.scalars(select(AiCall).where(AiCall.tenant_id == user.tenant_id, AiCall.offer_id == offer.id).order_by(AiCall.created_at.desc(), AiCall.id.desc()).limit(limit)).all()
+    return [{"id": item.id, "task": item.task, "account_id": item.account_id, "model": item.model, "status": item.status, "latency_ms": item.latency_ms, "prompt_tokens": item.prompt_tokens, "completion_tokens": item.completion_tokens, "cost_usd": item.cost_usd, "error_type": item.error_type, "created_at": item.created_at} for item in calls]
+
+
+@app.put("/api/v1/offers/{offer_id}/icp")
+def update_icp(offer_id: str, payload: IcpUpdateIn, db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "manager"))):
+    offer = db.scalar(select(Offer).where(Offer.id == offer_id, Offer.tenant_id == user.tenant_id))
+    if offer is None:
+        raise HTTPException(status_code=404, detail="Oferta não encontrada")
+    if payload.status == "approved":
+        from .icp_validation import validate_approved_icp
+
+        validate_approved_icp(payload.profile)
     icp = db.scalar(select(IcpProfile).where(IcpProfile.offer_id == offer.id, IcpProfile.tenant_id == user.tenant_id))
     if icp is None:
         icp = IcpProfile(tenant_id=user.tenant_id, offer_id=offer.id, profile_json=payload.profile, status=payload.status, generated_with="user", version=1)

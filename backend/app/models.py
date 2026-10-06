@@ -33,6 +33,20 @@ class User(Base):
     tenant: Mapped[Tenant] = relationship(back_populates="users")
 
 
+class UserInvitation(Base):
+    __tablename__ = "user_invitations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
+    email: Mapped[str] = mapped_column(String(320), index=True)
+    role: Mapped[str] = mapped_column(String(30))
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    created_by: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class SellerCompany(Base):
     __tablename__ = "seller_companies"
 
@@ -140,6 +154,41 @@ class TargetAccount(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class AccountSource(Base):
+    __tablename__ = "account_sources"
+    __table_args__ = (UniqueConstraint("tenant_id", "offer_id", "provider_id", "external_id", name="uq_account_source_provider_external"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
+    offer_id: Mapped[str] = mapped_column(ForeignKey("offers.id", ondelete="CASCADE"), index=True)
+    account_id: Mapped[str] = mapped_column(ForeignKey("target_accounts.id", ondelete="CASCADE"), index=True)
+    provider_id: Mapped[str] = mapped_column(String(100))
+    external_id: Mapped[str] = mapped_column(String(120))
+    source_url: Mapped[str | None] = mapped_column(String(1000))
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AccountContact(Base):
+    """A sourced contact channel; general channels are not decision makers."""
+
+    __tablename__ = "account_contacts"
+    __table_args__ = (UniqueConstraint("tenant_id", "account_id", "source_provider", "source_ref", name="uq_account_contact_source_ref"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
+    account_id: Mapped[str] = mapped_column(ForeignKey("target_accounts.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(24), default="general")
+    name: Mapped[str | None] = mapped_column(String(240))
+    title: Mapped[str | None] = mapped_column(String(200))
+    email: Mapped[str | None] = mapped_column(String(320))
+    phone: Mapped[str | None] = mapped_column(String(80))
+    confidence: Mapped[float] = mapped_column(default=0.5)
+    source_provider: Mapped[str] = mapped_column(String(100))
+    source_ref: Mapped[str] = mapped_column(String(120))
+    source_url: Mapped[str | None] = mapped_column(String(1000))
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class IntentSignal(Base):
     __tablename__ = "intent_signals"
 
@@ -202,17 +251,69 @@ class AccountBrief(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class AiCall(Base):
+    __tablename__ = "ai_calls"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
+    offer_id: Mapped[str] = mapped_column(ForeignKey("offers.id", ondelete="CASCADE"), index=True)
+    account_id: Mapped[str | None] = mapped_column(ForeignKey("target_accounts.id", ondelete="CASCADE"), index=True)
+    task: Mapped[str] = mapped_column(String(40))
+    model: Mapped[str] = mapped_column(String(120))
+    status: Mapped[str] = mapped_column(String(24))
+    latency_ms: Mapped[int] = mapped_column(default=0)
+    prompt_tokens: Mapped[int | None] = mapped_column()
+    completion_tokens: Mapped[int | None] = mapped_column()
+    cost_usd: Mapped[float | None] = mapped_column()
+    error_type: Mapped[str | None] = mapped_column(String(80))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class JobRun(Base):
     __tablename__ = "job_runs"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
     job_type: Mapped[str] = mapped_column(String(60))
+    provider_id: Mapped[str | None] = mapped_column(String(40))
     entity_id: Mapped[str | None] = mapped_column(String(36), index=True)
     status: Mapped[str] = mapped_column(String(30), default="queued", index=True)
     attempts: Mapped[int] = mapped_column(default=0)
     progress: Mapped[int] = mapped_column(default=0)
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class WorkflowRun(Base):
+    __tablename__ = "workflow_runs"
+    __table_args__ = (UniqueConstraint("tenant_id", "account_id", "discovery_job_id", name="uq_workflow_discovery_account"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
+    offer_id: Mapped[str] = mapped_column(ForeignKey("offers.id", ondelete="CASCADE"), index=True)
+    account_id: Mapped[str] = mapped_column(ForeignKey("target_accounts.id", ondelete="CASCADE"), index=True)
+    discovery_job_id: Mapped[str | None] = mapped_column(ForeignKey("job_runs.id", ondelete="SET NULL"), index=True)
+    status: Mapped[str] = mapped_column(String(24), default="queued", index=True)
+    attempts: Mapped[int] = mapped_column(default=0)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class WorkflowStep(Base):
+    __tablename__ = "workflow_steps"
+    __table_args__ = (UniqueConstraint("run_id", "name", name="uq_workflow_step_run_name"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    run_id: Mapped[str] = mapped_column(ForeignKey("workflow_runs.id", ondelete="CASCADE"), index=True)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(24), default="queued")
+    attempts: Mapped[int] = mapped_column(default=0)
+    error: Mapped[str | None] = mapped_column(Text)
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

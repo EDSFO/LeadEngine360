@@ -8,14 +8,15 @@ from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .database import get_db
 from .ai import generate_account_brief
-from .models import AccountActivity, AccountBrief, AccountScore, IcpProfile, IntentSignal, Offer, TargetAccount, User, utcnow
+from .ai_audit import record_ai_calls
+from .models import AccountActivity, AccountBrief, AccountContact, AccountScore, AccountSource, IcpProfile, IntentSignal, JobRun, Offer, OfferSourceSelection, TargetAccount, User, WorkflowRun, WorkflowStep, utcnow
 from .schemas import ActivityIn, SignalIn
-from .security import current_user
+from .security import current_user, require_roles
 
 router = APIRouter(prefix="/api/v1/offers/{offer_id}", tags=["accounts"])
 MAX_CSV_BYTES = 5 * 1024 * 1024
@@ -31,6 +32,31 @@ ALIASES = {
 def _normalized(value: str | None) -> str:
     value = unicodedata.normalize("NFKD", value or "").encode("ascii", "ignore").decode().lower()
     return re.sub(r"[^a-z0-9]+", " ", value).strip()
+
+
+def _size_matches(actual: str, candidate: str) -> bool:
+    """Match a provider's numeric headcount against an ICP size interval."""
+    observed = re.fullmatch(r"\s*(\d+)\s*", actual)
+    expected = re.fullmatch(r"\s*(\d+)\s*[-–,]\s*(\d+)\s*", candidate)
+    if observed and expected:
+        lower, upper = int(expected[1]), int(expected[2])
+        return lower <= int(observed[1]) <= upper
+    minimum = re.fullmatch(r"\s*(\d+)\s*\+\s*", candidate)
+    if observed and minimum:
+        return int(observed[1]) >= int(minimum[1])
+    return _normalized(candidate) == _normalized(actual)
+
+
+def _region_matches(actual: str, candidate: str) -> bool:
+    observed, expected = _normalized(actual), _normalized(candidate)
+    if expected in observed or observed in expected:
+        return True
+    country_aliases = {
+        "brasil": "br", "brazil": "br", "br": "br",
+        "estados unidos": "us", "united states": "us", "usa": "us", "us": "us",
+        "portugal": "pt", "pt": "pt",
+    }
+    return country_aliases.get(observed) is not None and country_aliases.get(observed) == country_aliases.get(expected)
 
 
 def _domain(value: str | None) -> str | None:
@@ -59,6 +85,9 @@ def _as_utc(value: datetime) -> datetime:
 
 
 def calculate_score(db: Session, account: TargetAccount, icp: IcpProfile) -> AccountScore:
+    # Sessions disable autoflush. Include newly recorded signals, activities and
+    # scores before querying; this also makes repeated domains in a CSV visible.
+    db.flush()
     profile = icp.profile_json if isinstance(icp.profile_json, dict) else {}
     criteria = profile.get("ideal_customer_profile") or {}
     if not isinstance(criteria, dict):
@@ -88,7 +117,7 @@ def calculate_score(db: Session, account: TargetAccount, icp: IcpProfile) -> Acc
             missing.append(label)
             continue
         actual_normalized = _normalized(actual)
-        if any(_normalized(candidate) in actual_normalized or actual_normalized in _normalized(candidate) for candidate in candidates):
+        if any(_size_matches(str(actual), candidate) if key == "company_size" else _region_matches(str(actual), candidate) if key == "regions" else (_normalized(candidate) in actual_normalized or actual_normalized in _normalized(candidate)) for candidate in candidates):
             matched.append(label)
             matched_weight += weight
         else:
@@ -101,6 +130,11 @@ def calculate_score(db: Session, account: TargetAccount, icp: IcpProfile) -> Acc
     account_text = _normalized(" ".join([account.name, account.domain or "", account.segment or "", account.employee_band or "", account.region or ""]))
     matched_exclusions = [value for value in exclusions if _normalized(value) and _normalized(value) in account_text]
     if matched_exclusions:
+        fit = 0
+    required_keys = criteria.get("required", []) if isinstance(criteria.get("required", []), list) else []
+    matched_keys = {key for key, label, _, _, _ in weighted_criteria if label in matched}
+    missing_required = [key for key in required_keys if key not in matched_keys]
+    if missing_required:
         fit = 0
 
     signals = db.scalars(select(IntentSignal).where(IntentSignal.account_id == account.id, IntentSignal.tenant_id == account.tenant_id)).all()
@@ -156,7 +190,7 @@ def calculate_score(db: Session, account: TargetAccount, icp: IcpProfile) -> Acc
         minimum_hot_confidence = min(1.0, max(0.0, float(raw_thresholds.get("minimum_hot_confidence", 0.6))))
     except (TypeError, ValueError):
         minimum_hot_confidence = 0.6
-    if matched_exclusions:
+    if matched_exclusions or missing_required:
         classification = "Cold"
     elif total >= hot_total and fit >= minimum_hot_fit and any(signal.confidence >= minimum_hot_confidence for signal in live_signals):
         classification = "Hot"
@@ -172,6 +206,7 @@ def calculate_score(db: Session, account: TargetAccount, icp: IcpProfile) -> Acc
         "mismatched_fit_criteria": excluded,
         "missing_fit_data": missing,
         "matched_exclusions": matched_exclusions,
+        "missing_required_criteria": missing_required,
         "active_signal_count": len(live_signals),
         "signal_contributions": signal_contributions,
         "latest_signal_title": latest_signal.title if latest_signal else None,
@@ -199,8 +234,121 @@ def _account_payload(account: TargetAccount, score: AccountScore | None) -> dict
     }
 
 
+@router.post("/discovery", status_code=202)
+def start_discovery(offer_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "manager", "analyst")), provider_id: str | None = None):
+    from .discovery import DiscoveryConfigError, validate_osm_discovery
+
+    offer, icp = _approved_offer(db, offer_id, user)
+    # Serialize concurrent starts for the same offer on PostgreSQL.
+    db.scalar(select(Offer).where(Offer.id == offer.id, Offer.tenant_id == user.tenant_id).with_for_update())
+    provider_id = provider_id or "osm-overpass"
+    if provider_id not in {"osm-overpass", "apollo", "hunter"}:
+        raise HTTPException(status_code=422, detail="Fonte de descoberta inválida")
+    selected = db.scalar(select(OfferSourceSelection.id).where(
+        OfferSourceSelection.offer_id == offer.id,
+        OfferSourceSelection.tenant_id == user.tenant_id,
+        OfferSourceSelection.provider_id == provider_id,
+        OfferSourceSelection.enabled.is_(True),
+    ))
+    if not selected:
+        raise HTTPException(status_code=409, detail="Ative a fonte escolhida nas integrações desta oferta")
+    try:
+        if provider_id == "osm-overpass":
+            validate_osm_discovery(icp.profile_json)
+        else:
+            from .commercial_discovery import build_apollo_params, build_hunter_filters
+            from .config import settings
+            if provider_id == "apollo":
+                build_apollo_params(icp.profile_json)
+            else:
+                build_hunter_filters(icp.profile_json)
+            if provider_id == "apollo" and not settings.apollo_api_key:
+                raise HTTPException(status_code=409, detail="APOLLO_API_KEY não configurada no servidor")
+            if provider_id == "hunter" and not settings.hunter_api_key:
+                raise HTTPException(status_code=409, detail="HUNTER_API_KEY não configurada no servidor")
+    except DiscoveryConfigError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    active = db.scalar(select(JobRun).where(
+        JobRun.tenant_id == user.tenant_id, JobRun.entity_id == offer.id,
+        JobRun.job_type == "account_discovery", JobRun.status.in_(["queued", "processing", "retrying"]),
+    ).order_by(JobRun.created_at.desc()))
+    if active:
+        return {"job_id": active.id, "status": active.status, "provider_id": active.provider_id}
+    job = JobRun(tenant_id=user.tenant_id, entity_id=offer.id, job_type="account_discovery", provider_id=provider_id, status="queued")
+    db.add(job)
+    db.commit()
+    try:
+        from .tasks import discover_accounts
+
+        discover_accounts.delay(job.id, user.tenant_id, offer.id)
+    except Exception:
+        job.status = "failed"
+        job.error = "A fila de descoberta está indisponível"
+        job.finished_at = utcnow()
+        db.commit()
+        raise HTTPException(status_code=503, detail="A fila de descoberta está indisponível") from None
+    return {"job_id": job.id, "status": job.status, "provider_id": job.provider_id}
+
+
+@router.get("/discovery")
+def latest_discovery(offer_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    offer = db.scalar(select(Offer).where(Offer.id == offer_id, Offer.tenant_id == user.tenant_id))
+    if offer is None:
+        raise HTTPException(status_code=404, detail="Oferta não encontrada")
+    job = db.scalar(select(JobRun).where(
+        JobRun.tenant_id == user.tenant_id, JobRun.entity_id == offer.id,
+        JobRun.job_type == "account_discovery",
+    ).order_by(JobRun.created_at.desc(), JobRun.id.desc()))
+    return {"job_id": job.id, "status": job.status, "error": job.error, "progress": job.progress} if job else None
+
+
+@router.get("/workflows")
+def list_workflows(offer_id: str, limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0), db: Session = Depends(get_db), user: User = Depends(current_user)):
+    offer = db.scalar(select(Offer).where(Offer.id == offer_id, Offer.tenant_id == user.tenant_id))
+    if offer is None:
+        raise HTTPException(status_code=404, detail="Oferta não encontrada")
+    where = (WorkflowRun.tenant_id == user.tenant_id, WorkflowRun.offer_id == offer_id)
+    total = db.scalar(select(func.count()).select_from(WorkflowRun).where(*where)) or 0
+    rows = db.execute(select(WorkflowRun, TargetAccount.name).join(TargetAccount, TargetAccount.id == WorkflowRun.account_id).where(*where).order_by(WorkflowRun.created_at.desc(), WorkflowRun.id.desc()).limit(limit).offset(offset)).all()
+    return {"total": total, "items": [{"id": run.id, "account_id": run.account_id, "account_name": name, "discovery_job_id": run.discovery_job_id, "status": run.status, "attempts": run.attempts, "error": run.error, "created_at": run.created_at, "finished_at": run.finished_at} for run, name in rows]}
+
+
+@router.get("/workflows/{run_id}")
+def get_workflow(offer_id: str, run_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    run = db.scalar(select(WorkflowRun).where(WorkflowRun.id == run_id, WorkflowRun.offer_id == offer_id, WorkflowRun.tenant_id == user.tenant_id))
+    if run is None:
+        raise HTTPException(status_code=404, detail="Processamento não encontrado")
+    steps = db.scalars(select(WorkflowStep).where(WorkflowStep.run_id == run.id, WorkflowStep.tenant_id == user.tenant_id).order_by(WorkflowStep.id)).all()
+    return {"id": run.id, "account_id": run.account_id, "status": run.status, "attempts": run.attempts, "error": run.error, "steps": [{"name": step.name, "status": step.status, "attempts": step.attempts, "error": step.error, "details": step.details, "started_at": step.started_at, "finished_at": step.finished_at} for step in steps]}
+
+
+@router.post("/workflows/{run_id}/retry", status_code=202)
+def retry_workflow(offer_id: str, run_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "manager", "analyst"))):
+    from .tasks import process_account
+
+    run = db.scalar(select(WorkflowRun).where(WorkflowRun.id == run_id, WorkflowRun.offer_id == offer_id, WorkflowRun.tenant_id == user.tenant_id).with_for_update())
+    if run is None:
+        raise HTTPException(status_code=404, detail="Processamento não encontrado")
+    if run.status != "failed":
+        raise HTTPException(status_code=409, detail="Apenas processamentos com falha podem ser reenfileirados")
+    _, icp = _approved_offer(db, offer_id, user)
+    run.status = "queued"
+    run.error = None
+    run.finished_at = None
+    db.commit()
+    try:
+        process_account.delay(run.id, user.tenant_id)
+    except Exception:
+        run.status = "failed"
+        run.error = "A fila de processamento está indisponível"
+        run.finished_at = utcnow()
+        db.commit()
+        raise HTTPException(status_code=503, detail=run.error) from None
+    return {"id": run.id, "status": run.status, "icp_version": icp.version}
+
+
 @router.post("/accounts/import", status_code=201)
-async def import_accounts(offer_id: str, file: UploadFile = File(...), db: Session = Depends(get_db), user: User = Depends(current_user)):
+async def import_accounts(offer_id: str, file: UploadFile = File(...), db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "manager", "analyst"))):
     offer, icp = _approved_offer(db, offer_id, user)
     if not (file.filename or "").lower().endswith(".csv"):
         raise HTTPException(status_code=415, detail="Envie um arquivo CSV")
@@ -271,8 +419,9 @@ def list_accounts(offer_id: str, classification: str | None = Query(default=None
     if search:
         like = f"%{search.strip()}%"
         query = query.where((TargetAccount.name.ilike(like)) | (TargetAccount.domain.ilike(like)) | (TargetAccount.segment.ilike(like)))
+    total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
     pairs = db.execute(query.order_by(AccountScore.total.desc().nullslast(), TargetAccount.name).offset(offset).limit(limit)).all()
-    return {"items": [_account_payload(account, score) for account, score in pairs], "limit": limit, "offset": offset}
+    return {"items": [_account_payload(account, score) for account, score in pairs], "total": total, "limit": limit, "offset": offset}
 
 
 @router.get("/accounts/export")
@@ -282,11 +431,11 @@ def export_accounts(offer_id: str, db: Session = Depends(get_db), user: User = D
         raise HTTPException(status_code=404, detail="Oferta não encontrada")
     query = select(TargetAccount, AccountScore).outerjoin(AccountScore, (AccountScore.account_id == TargetAccount.id) & (AccountScore.tenant_id == user.tenant_id) & (AccountScore.offer_id == offer.id)).where(TargetAccount.tenant_id == user.tenant_id, TargetAccount.offer_id == offer.id).order_by(AccountScore.total.desc().nullslast(), TargetAccount.name)
     output = io.StringIO(newline="")
-    columns = ["empresa", "dominio", "segmento", "porte", "regiao", "fit", "intencao", "engajamento", "timing", "score_total", "classificacao", "explicacao"]
+    columns = ["empresa", "dominio", "segmento", "porte", "regiao", "fonte", "licenca_fonte", "fit", "intencao", "engajamento", "timing", "score_total", "classificacao", "explicacao"]
     writer = csv.DictWriter(output, fieldnames=columns, extrasaction="ignore")
     writer.writeheader()
     for account, score in db.execute(query).all():
-        writer.writerow({"empresa": account.name, "dominio": account.domain or "", "segmento": account.segment or "", "porte": account.employee_band or "", "regiao": account.region or "", "fit": score.fit if score else 0, "intencao": score.intent if score else 0, "engajamento": score.engagement if score else 0, "timing": score.timing if score else 0, "score_total": score.total if score else 0, "classificacao": score.classification if score else "Cold", "explicacao": "; ".join((score.explanation or {}).get("matched_fit_criteria", [])) if score else ""})
+        writer.writerow({"empresa": account.name, "dominio": account.domain or "", "segmento": account.segment or "", "porte": account.employee_band or "", "regiao": account.region or "", "fonte": account.source, "licenca_fonte": "© OpenStreetMap contributors · ODbL · https://www.openstreetmap.org/copyright" if account.source == "osm-overpass" else "", "fit": score.fit if score else 0, "intencao": score.intent if score else 0, "engajamento": score.engagement if score else 0, "timing": score.timing if score else 0, "score_total": score.total if score else 0, "classificacao": score.classification if score else "Cold", "explicacao": "; ".join((score.explanation or {}).get("matched_fit_criteria", [])) if score else ""})
     output.seek(0)
     return StreamingResponse(iter(["\ufeff" + output.getvalue()]), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f"attachment; filename=leadengine360-{offer.id[:8]}.csv"})
 
@@ -300,6 +449,29 @@ def list_signals(offer_id: str, account_id: str, db: Session = Depends(get_db), 
     return [{"id": signal.id, "signal_type": signal.signal_type, "title": signal.title, "description": signal.description, "source_url": signal.source_url, "evidence": signal.evidence, "occurred_at": signal.occurred_at, "confidence": signal.confidence, "strength": signal.strength} for signal in signals]
 
 
+@router.get("/accounts/{account_id}/sources")
+def list_account_sources(offer_id: str, account_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    account = db.scalar(select(TargetAccount).where(TargetAccount.id == account_id, TargetAccount.offer_id == offer_id, TargetAccount.tenant_id == user.tenant_id))
+    if account is None:
+        raise HTTPException(status_code=404, detail="Conta não encontrada")
+    sources = db.scalars(select(AccountSource).where(
+        AccountSource.account_id == account.id, AccountSource.offer_id == offer_id,
+        AccountSource.tenant_id == user.tenant_id,
+    ).order_by(AccountSource.observed_at.desc())).all()
+    return [{"provider_id": item.provider_id, "external_id": item.external_id, "source_url": item.source_url, "observed_at": item.observed_at} for item in sources]
+
+
+@router.get("/accounts/{account_id}/contacts")
+def list_account_contacts(offer_id: str, account_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    account = db.scalar(select(TargetAccount).where(TargetAccount.id == account_id, TargetAccount.offer_id == offer_id, TargetAccount.tenant_id == user.tenant_id))
+    if account is None:
+        raise HTTPException(status_code=404, detail="Conta não encontrada")
+    contacts = db.scalars(select(AccountContact).where(
+        AccountContact.account_id == account.id, AccountContact.tenant_id == user.tenant_id,
+    ).order_by(AccountContact.observed_at.desc())).all()
+    return [{"id": item.id, "kind": item.kind, "name": item.name, "title": item.title, "email": item.email, "phone": item.phone, "confidence": item.confidence, "source_provider": item.source_provider, "source_url": item.source_url, "observed_at": item.observed_at} for item in contacts]
+
+
 @router.get("/accounts/{account_id}/activities")
 def list_activities(offer_id: str, account_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
     account = db.scalar(select(TargetAccount).where(TargetAccount.id == account_id, TargetAccount.offer_id == offer_id, TargetAccount.tenant_id == user.tenant_id))
@@ -310,7 +482,7 @@ def list_activities(offer_id: str, account_id: str, db: Session = Depends(get_db
 
 
 @router.post("/accounts/{account_id}/activities", status_code=201)
-def create_activity(offer_id: str, account_id: str, payload: ActivityIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
+def create_activity(offer_id: str, account_id: str, payload: ActivityIn, db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "manager", "sdr", "closer"))):
     offer, icp = _approved_offer(db, offer_id, user)
     account = db.scalar(select(TargetAccount).where(TargetAccount.id == account_id, TargetAccount.offer_id == offer.id, TargetAccount.tenant_id == user.tenant_id))
     if account is None:
@@ -331,27 +503,49 @@ def create_activity(offer_id: str, account_id: str, payload: ActivityIn, db: Ses
 
 
 @router.post("/accounts/{account_id}/brief")
-async def create_account_brief(offer_id: str, account_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
-    offer, _ = _approved_offer(db, offer_id, user)
+async def create_account_brief(offer_id: str, account_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "manager", "analyst", "sdr", "closer"))):
+    offer, icp = _approved_offer(db, offer_id, user)
     account = db.scalar(select(TargetAccount).where(TargetAccount.id == account_id, TargetAccount.offer_id == offer.id, TargetAccount.tenant_id == user.tenant_id))
     if account is None:
         raise HTTPException(status_code=404, detail="Conta não encontrada")
-    signals = db.scalars(select(IntentSignal).where(IntentSignal.account_id == account.id, IntentSignal.tenant_id == user.tenant_id).order_by(IntentSignal.occurred_at.desc()).limit(20)).all()
+    saved = await generate_and_store_brief(db, offer, account, icp)
+    db.commit()
+    db.refresh(saved)
+    return {"id": saved.id, "account_id": account.id, "offer_id": offer.id, "generated_with": saved.generated_with, "brief": saved.brief_json, "updated_at": saved.updated_at}
+
+
+async def generate_and_store_brief(db: Session, offer: Offer, account: TargetAccount, icp: IcpProfile) -> AccountBrief:
+    signals = db.scalars(select(IntentSignal).where(IntentSignal.account_id == account.id, IntentSignal.tenant_id == account.tenant_id).order_by(IntentSignal.occurred_at.desc()).limit(20)).all()
     signal_data = [{"title": signal.title, "description": signal.description, "source_url": signal.source_url, "occurred_at": signal.occurred_at.isoformat(), "confidence": signal.confidence, "strength": signal.strength} for signal in signals]
-    brief, model = await generate_account_brief({"name": offer.name, "description": offer.description, "problem_solved": offer.problem_solved, "differentiators": offer.differentiators}, {"name": account.name, "domain": account.domain, "segment": account.segment, "employee_band": account.employee_band, "region": account.region}, signal_data)
-    saved = db.scalar(select(AccountBrief).where(AccountBrief.tenant_id == user.tenant_id, AccountBrief.account_id == account.id, AccountBrief.offer_id == offer.id))
+    score = db.scalar(select(AccountScore).where(AccountScore.account_id == account.id, AccountScore.offer_id == offer.id, AccountScore.tenant_id == account.tenant_id))
+    if score is None or score.scoring_version != icp.version:
+        score = calculate_score(db, account, icp)
+    score_context = {"fit": score.fit, "intent": score.intent, "engagement": score.engagement, "timing": score.timing, "total": score.total, "classification": score.classification, "explanation": score.explanation}
+    trace: list[dict] = []
+    brief, model = await generate_account_brief({"name": offer.name, "description": offer.description, "problem_solved": offer.problem_solved, "differentiators": offer.differentiators}, {"name": account.name, "domain": account.domain, "segment": account.segment, "employee_band": account.employee_band, "region": account.region}, signal_data, score_context, icp.profile_json, trace)
+    saved = db.scalar(select(AccountBrief).where(AccountBrief.tenant_id == account.tenant_id, AccountBrief.account_id == account.id, AccountBrief.offer_id == offer.id))
     if saved is None:
-        saved = AccountBrief(tenant_id=user.tenant_id, account_id=account.id, offer_id=offer.id)
+        saved = AccountBrief(tenant_id=account.tenant_id, account_id=account.id, offer_id=offer.id)
         db.add(saved)
     saved.brief_json = brief
     saved.generated_with = model
-    db.commit()
-    db.refresh(saved)
-    return {"id": saved.id, "account_id": account.id, "offer_id": offer.id, "generated_with": model, "brief": brief, "updated_at": saved.updated_at}
+    record_ai_calls(db, account.tenant_id, offer.id, "generate_brief", trace, account.id)
+    return saved
+
+
+@router.get("/accounts/{account_id}/brief")
+def get_account_brief(offer_id: str, account_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    account = db.scalar(select(TargetAccount).where(TargetAccount.id == account_id, TargetAccount.offer_id == offer_id, TargetAccount.tenant_id == user.tenant_id))
+    if account is None:
+        raise HTTPException(status_code=404, detail="Conta não encontrada")
+    saved = db.scalar(select(AccountBrief).where(AccountBrief.tenant_id == user.tenant_id, AccountBrief.account_id == account.id, AccountBrief.offer_id == offer_id))
+    if saved is None:
+        raise HTTPException(status_code=404, detail="Brief ainda não gerado")
+    return {"id": saved.id, "account_id": account.id, "offer_id": offer_id, "generated_with": saved.generated_with, "brief": saved.brief_json, "updated_at": saved.updated_at}
 
 
 @router.post("/accounts/{account_id}/signals", status_code=201)
-def create_signal(offer_id: str, account_id: str, payload: SignalIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
+def create_signal(offer_id: str, account_id: str, payload: SignalIn, db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "manager", "analyst"))):
     offer, icp = _approved_offer(db, offer_id, user)
     account = db.scalar(select(TargetAccount).where(TargetAccount.id == account_id, TargetAccount.offer_id == offer.id, TargetAccount.tenant_id == user.tenant_id))
     if account is None:

@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useEffect, useMemo, useState } from "react";
 import "../styles.css";
@@ -46,7 +46,7 @@ export default function IntegrationsPage() {
     setBusy(true); setNotice("");
     try {
       await api(`/offers/${offerId}/integrations`, token, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider_ids: selected }) });
-      setNotice("Preferências desta oferta foram salvas. Os itens marcados como planejados ainda precisam de implementação e configuração.");
+      setNotice("Preferências salvas. Apollo e Hunter precisam das respectivas chaves e acesso aos endpoints no servidor.");
     } catch (error) { setNotice(error instanceof Error ? error.message : "Falha ao salvar as preferências."); }
     finally { setBusy(false); }
   }

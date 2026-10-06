@@ -1,3 +1,5 @@
+param([ValidateRange(1, 65535)][int]$AppPort)
+
 $ErrorActionPreference = 'Stop'
 $projectDir = Split-Path -Parent $PSScriptRoot
 Set-Location $projectDir
@@ -29,16 +31,25 @@ if (-not (Test-Path -LiteralPath $envPath)) {
 
 $configured = [IO.File]::ReadAllText($envPath)
 $configured = [regex]::Replace($configured, '(?m)^APP_BIND_IP=.*$', 'APP_BIND_IP=0.0.0.0')
-$configured = [regex]::Replace($configured, '(?m)^APP_PORT=.*$', 'APP_PORT=3002')
-$configured = [regex]::Replace($configured, '(?m)^FRONTEND_ORIGIN=.*$', 'FRONTEND_ORIGIN=http://localhost:3002')
-if ($configured -notmatch '(?m)^APP_PORT=') { $configured += "`nAPP_PORT=3002`n" }
+if ($AppPort) {
+    $configured = [regex]::Replace($configured, '(?m)^APP_PORT=.*$', "APP_PORT=$AppPort")
+    if ($configured -notmatch '(?m)^APP_PORT=') { $configured += "`nAPP_PORT=$AppPort`n" }
+}
+$portMatch = [regex]::Match($configured, '(?m)^APP_PORT=(\d+)\s*$')
+if (-not $portMatch.Success) { throw 'Defina APP_PORT na .env ou informe -AppPort.' }
+$resolvedPort = [int]$portMatch.Groups[1].Value
+$configured = [regex]::Replace($configured, '(?m)^FRONTEND_ORIGIN=.*$', "FRONTEND_ORIGIN=http://localhost:$resolvedPort")
 if ($configured -match 'replace-with-a-long-random' -or $configured -match '(?m)^(JWT_SECRET|POSTGRES_PASSWORD)=$') {
     throw 'Configure JWT_SECRET e POSTGRES_PASSWORD antes de implantar.'
 }
+$portInUse = Get-NetTCPConnection -State Listen -LocalPort $resolvedPort -ErrorAction SilentlyContinue
+if ($portInUse) {
+    $published = docker compose port web 3000 2>$null
+    if ($LASTEXITCODE -ne 0 -or $published -notmatch ":$resolvedPort$") {
+        throw "A porta $resolvedPort já está em uso por outro serviço na innovaapps."
+    }
+}
 [IO.File]::WriteAllText($envPath, $configured, [Text.UTF8Encoding]::new($false))
-
-$portInUse = Get-NetTCPConnection -State Listen -LocalPort 3002 -ErrorAction SilentlyContinue
-if ($portInUse -and -not (docker compose ps -q web)) { throw 'A porta 3002 já está em uso na innovaapps.' }
 
 docker compose config --quiet
 if ($LASTEXITCODE -ne 0) { throw 'docker compose config falhou.' }
@@ -56,15 +67,16 @@ foreach ($baseImage in @('postgres:17-alpine', 'redis:7-alpine', 'python:3.12-sl
 docker build --pull=false -t leadengine360-api ./backend
 if ($LASTEXITCODE -ne 0) { throw 'Falha ao construir a API.' }
 docker tag leadengine360-api:latest leadengine360-worker:latest
+docker tag leadengine360-api:latest leadengine360-scheduler:latest
 docker build --pull=false -t leadengine360-web ./frontend
 if ($LASTEXITCODE -ne 0) { throw 'Falha ao construir a interface.' }
 docker compose up --no-build --pull never -d
 if ($LASTEXITCODE -ne 0) { throw 'docker compose up falhou.' }
 
-$ruleName = 'LeadEngine360 3002 LAN e Tailscale'
+$ruleName = "LeadEngine360 $resolvedPort LAN e Tailscale"
 if (-not (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue)) {
-    New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3002 -Profile Any -RemoteAddress 'LocalSubnet', '100.64.0.0/10' | Out-Null
+    New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort $resolvedPort -Profile Any -RemoteAddress 'LocalSubnet', '100.64.0.0/10' | Out-Null
 }
 
 docker compose ps
-Write-Output 'Acesse http://<IP_LAN>:3002 na LAN ou http://<IP_TAILSCALE>:3002 pela Tailscale'
+Write-Output "Acesse http://<IP_LAN>:$resolvedPort na LAN ou http://<IP_TAILSCALE>:$resolvedPort pela Tailscale"

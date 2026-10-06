@@ -29,11 +29,20 @@ services:
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       OPENROUTER_MODEL: ${OPENROUTER_MODEL:-google/gemini-2.5-flash}
+      OPENROUTER_FALLBACK_MODELS: ${OPENROUTER_FALLBACK_MODELS:-}
+      APOLLO_API_KEY: ${APOLLO_API_KEY:-}
+      HUNTER_API_KEY: ${HUNTER_API_KEY:-}
+      OVERPASS_URL: ${OVERPASS_URL:-https://overpass-api.de/api/interpreter}
       REDIS_URL: redis://redis:6379/0
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:3000}
       UPLOAD_DIR: /data/uploads
     volumes:
       - uploads:/data/uploads
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
     depends_on:
       db:
         condition: service_healthy
@@ -46,9 +55,27 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://leadengine:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/leadengine360
       REDIS_URL: redis://redis:6379/0
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-google/gemini-2.5-flash}
+      OPENROUTER_FALLBACK_MODELS: ${OPENROUTER_FALLBACK_MODELS:-}
+      APOLLO_API_KEY: ${APOLLO_API_KEY:-}
+      HUNTER_API_KEY: ${HUNTER_API_KEY:-}
+      OVERPASS_URL: ${OVERPASS_URL:-https://overpass-api.de/api/interpreter}
       UPLOAD_DIR: /data/uploads
     volumes:
       - uploads:/data/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  scheduler:
+    build: ./backend
+    restart: unless-stopped
+    command: celery -A app.worker.celery_app beat --loglevel=INFO
+    environment:
+      DATABASE_URL: postgresql+psycopg://leadengine:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/leadengine360
+      REDIS_URL: redis://redis:6379/0
     depends_on:
       db:
         condition: service_healthy
@@ -63,7 +90,8 @@ services:
     ports:
       - "${APP_BIND_IP:-127.0.0.1}:${APP_PORT:-3000}:3000"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
 volumes:
   postgres_data:
   redis_data:

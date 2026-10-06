@@ -13,6 +13,8 @@ from .config import settings
 from .database import get_db
 from .models import User
 
+ROLES = {"admin", "manager", "analyst", "sdr", "closer"}
+
 bearer = HTTPBearer(auto_error=False)
 
 
@@ -66,3 +68,12 @@ def current_user(
         return user
     except (ValueError, KeyError, TypeError, json.JSONDecodeError):
         raise HTTPException(status_code=401, detail="Token inválido ou expirado") from None
+
+
+def require_roles(*allowed: str):
+    def check(user: User = Depends(current_user)) -> User:
+        if user.role not in allowed:
+            raise HTTPException(status_code=403, detail="Seu perfil não permite esta ação")
+        return user
+
+    return check

@@ -12,6 +12,20 @@ class LoginIn(BaseModel):
     password: str
 
 
+class InvitationIn(BaseModel):
+    email: EmailStr
+    role: str = Field(pattern="^(admin|manager|analyst|sdr|closer)$")
+
+
+class AcceptInvitationIn(BaseModel):
+    token: str = Field(min_length=20, max_length=200)
+    password: str = Field(min_length=10, max_length=128)
+
+
+class RoleUpdateIn(BaseModel):
+    role: str = Field(pattern="^(admin|manager|analyst|sdr|closer)$")
+
+
 class OfferIn(BaseModel):
     id: str | None = None
     name: str = Field(min_length=2, max_length=200)

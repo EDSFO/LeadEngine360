@@ -12,17 +12,16 @@ from sqlalchemy.orm import Session
 
 from .database import get_db
 from .models import Offer, OfferSourceSelection, User
-from .security import current_user
+from .security import current_user, require_roles
 
 router = APIRouter()
 
 CATALOG = [
-    {"id": "csv-accounts", "stage": "Descoberta de empresas", "name": "Importação CSV", "providers": "LeadEngine360", "type": "open", "status": "available", "description": "Importa empresas e calcula Fit contra o ICP aprovado."},
-    {"id": "osm-overpass", "stage": "Descoberta de empresas", "name": "OpenStreetMap / Overpass", "providers": "OpenStreetMap", "type": "open", "status": "planned", "description": "Alternativa aberta para descoberta geográfica e negócios locais; cobertura varia por região."},
-    {"id": "apollo", "stage": "Fornecedores de leads", "name": "Apollo.io", "providers": "Apollo.io", "type": "commercial", "status": "planned", "description": "Conector via API oficial, sujeito a credenciais e plano do fornecedor."},
+    {"id": "osm-overpass", "stage": "Descoberta de empresas", "name": "OpenStreetMap / Overpass", "providers": "OpenStreetMap", "type": "open", "status": "available", "description": "Busca negócios com site por tag OSM e área geográfica configuradas no ICP. Cobertura varia por nicho e região; requer worker ativo."},
+    {"id": "apollo", "stage": "Fornecedores de leads", "name": "Apollo.io", "providers": "Apollo.io", "type": "commercial", "status": "available", "description": "Busca empresas pela API oficial. Requer APOLLO_API_KEY e acesso do plano ao Organization Search."},
+    {"id": "hunter", "stage": "Fornecedores de leads", "name": "Hunter", "providers": "Hunter", "type": "commercial", "status": "available", "description": "Discover busca empresas; Domain Search encontra contatos em domínios encontrados. Requer HUNTER_API_KEY e cota disponível."},
     {"id": "linkedin-sales-nav", "stage": "Fornecedores de leads", "name": "LinkedIn Sales Navigator", "providers": "LinkedIn", "type": "commercial", "status": "planned", "description": "Entrada por integração/exportação autorizada; automação de navegação não faz parte do MVP."},
     {"id": "ocean", "stage": "Fornecedores de leads", "name": "Ocean.io", "providers": "Ocean.io", "type": "commercial", "status": "planned", "description": "Conector de descoberta/enriquecimento sujeito a API e contrato."},
-    {"id": "inbound-csv", "stage": "Leads de marketing inbound", "name": "Importação de leads inbound", "providers": "CSV", "type": "open", "status": "available", "description": "Leads capturados podem ser carregados como contas usando o importador CSV."},
     {"id": "hubspot", "stage": "Leads de marketing inbound", "name": "HubSpot", "providers": "HubSpot", "type": "commercial", "status": "planned", "description": "Integração oficial/API ou webhook após configurar credenciais."},
     {"id": "inbound-webhook", "stage": "Leads de marketing inbound", "name": "Webhook de entrada", "providers": "Integração própria", "type": "open", "status": "planned", "description": "Receber leads de formulários e automações compatíveis."},
     {"id": "contact-enrichment", "stage": "Mapeamento de e-mail e telefone", "name": "Enriquecimento de contatos", "providers": "Prospeo · LeadMagic · LeadIQ", "type": "commercial", "status": "planned", "description": "Adaptadores de API opcionais; não há base aberta equivalente com cobertura geral."},
@@ -59,7 +58,7 @@ def get_offer_integrations(offer_id: str, db: Session = Depends(get_db), user: U
 
 
 @router.put("/api/v1/offers/{offer_id}/integrations")
-def save_offer_integrations(offer_id: str, payload: SelectionIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
+def save_offer_integrations(offer_id: str, payload: SelectionIn, db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "manager", "analyst"))):
     offer = db.scalar(select(Offer).where(Offer.id == offer_id, Offer.tenant_id == user.tenant_id))
     if offer is None:
         raise HTTPException(status_code=404, detail="Oferta não encontrada")
@@ -76,4 +75,4 @@ def save_offer_integrations(offer_id: str, payload: SelectionIn, db: Session = D
     for provider_id in wanted - existing.keys():
         db.add(OfferSourceSelection(tenant_id=user.tenant_id, offer_id=offer.id, provider_id=provider_id, enabled=True))
     db.commit()
-    return {"provider_ids": sorted(wanted), "saved": True, "note": "Preferências salvas. Conectores planejados ainda precisam ser implementados e configurados."}
+    return {"provider_ids": sorted(wanted), "saved": True, "note": "Preferências salvas. Apollo e Hunter exigem chaves configuradas no servidor e acesso do plano aos endpoints."}

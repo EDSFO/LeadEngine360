@@ -1,9 +1,58 @@
 import json
+import logging
+import math
 import re
+import time
+from collections.abc import Callable
 
 import httpx
 
 from .config import settings
+
+logger = logging.getLogger(__name__)
+
+
+def _usage_number(value: object, integer: bool = False) -> int | float | None:
+    try:
+        number = float(value) if value is not None and not isinstance(value, bool) else float("nan")
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return int(number) if integer else number
+
+
+def _configured_models() -> list[str]:
+    models = [settings.openrouter_model, *(value.strip() for value in settings.openrouter_fallback_models.split(","))]
+    return list(dict.fromkeys(model for model in models if model))
+
+
+async def _complete_json(prompt: dict, is_valid: Callable[[dict], bool], trace: list[dict] | None = None) -> tuple[dict | None, str]:
+    if not settings.openrouter_api_key:
+        return None, "heuristic"
+    async with httpx.AsyncClient(timeout=httpx.Timeout(45.0)) as client:
+        for model in _configured_models():
+            started = time.perf_counter()
+            try:
+                response = await client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {settings.openrouter_api_key}", "Content-Type": "application/json"},
+                    json={"model": model, "messages": [{"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}], "response_format": {"type": "json_object"}, "temperature": 0.2},
+                )
+                response.raise_for_status()
+                payload = response.json()
+                result = json.loads(payload["choices"][0]["message"]["content"])
+                if not isinstance(result, dict) or not is_valid(result):
+                    raise ValueError("Resposta JSON fora do contrato")
+                usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+                if trace is not None:
+                    trace.append({"model": model, "status": "completed", "latency_ms": round((time.perf_counter() - started) * 1000), "prompt_tokens": _usage_number(usage.get("prompt_tokens"), integer=True), "completion_tokens": _usage_number(usage.get("completion_tokens"), integer=True), "cost_usd": _usage_number(usage.get("cost"))})
+                return result, model
+            except (httpx.HTTPError, KeyError, IndexError, json.JSONDecodeError, ValueError, TypeError) as exc:
+                if trace is not None:
+                    trace.append({"model": model, "status": "failed", "latency_ms": round((time.perf_counter() - started) * 1000), "error_type": type(exc).__name__})
+                logger.warning("ai_model_attempt_failed", extra={"model": model, "error_type": type(exc).__name__})
+    return None, "heuristic_fallback"
 
 
 def _fallback_profile(offer: dict, evidence: list[dict]) -> dict:
@@ -26,11 +75,8 @@ def _fallback_profile(offer: dict, evidence: list[dict]) -> dict:
     }
 
 
-async def generate_profile(company: dict, offer: dict, evidence: list[dict]) -> tuple[dict, str]:
+async def generate_profile(company: dict, offer: dict, evidence: list[dict], trace: list[dict] | None = None) -> tuple[dict, str]:
     fallback = _fallback_profile(offer, evidence)
-    if not settings.openrouter_api_key:
-        return fallback, "heuristic"
-
     prompt = {
         "role": "Analista de inteligência comercial B2B",
         "instructions": [
@@ -47,36 +93,24 @@ async def generate_profile(company: dict, offer: dict, evidence: list[dict]) -> 
         "offer": offer,
         "retrieved_evidence": [{"filename": row["filename"], "content": row["content"]} for row in evidence],
     }
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(45.0)) as client:
-            response = await client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {settings.openrouter_api_key}", "Content-Type": "application/json"},
-                json={"model": settings.openrouter_model, "messages": [{"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}], "response_format": {"type": "json_object"}, "temperature": 0.2},
-            )
-            response.raise_for_status()
-            payload = response.json()
-            content = payload["choices"][0]["message"]["content"]
-            profile = json.loads(content)
-            if not isinstance(profile, dict) or "ideal_customer_profile" not in profile:
-                raise ValueError("Formato de perfil inválido")
-            return profile, settings.openrouter_model
-    except (httpx.HTTPError, KeyError, IndexError, json.JSONDecodeError, ValueError, TypeError):
-        return fallback, "heuristic_fallback"
+    profile, model = await _complete_json(prompt, lambda result: isinstance(result.get("ideal_customer_profile"), dict), trace)
+    return (profile or fallback), model
 
 
-async def generate_account_brief(offer: dict, account: dict, signals: list[dict]) -> tuple[dict, str]:
+async def generate_account_brief(offer: dict, account: dict, signals: list[dict], score: dict | None = None, icp: dict | None = None, trace: list[dict] | None = None) -> tuple[dict, str]:
+    score = score or {}
+    explanation = score.get("explanation") if isinstance(score.get("explanation"), dict) else {}
+    matched = explanation.get("matched_fit_criteria") or []
     fallback = {
         "account_facts": {key: value for key, value in account.items() if value},
-        "offer_fit_hypothesis": "A conta compartilha critérios do ICP aprovado. Valide as necessidades específicas antes de presumir aderência.",
+        "offer_fit_hypothesis": f"Critérios de Fit correspondentes: {', '.join(matched)}. Confirme necessidades antes de presumir aderência." if matched else "Não há critérios de Fit confirmados para esta conta. Verifique os dados antes de presumir aderência.",
+        "score": {key: score.get(key) for key in ("fit", "intent", "engagement", "timing", "total", "classification") if key in score},
         "observed_signals": [{"title": item["title"], "description": item["description"], "occurred_at": item["occurred_at"], "source": item["source_url"] or "Registro manual", "confidence": item["confidence"]} for item in signals],
         "unknowns": ["Problema atual e prioridade da empresa", "Processo de compra e pessoas envolvidas", "Solução utilizada hoje"],
         "discovery_questions": ["Como sua equipe lida hoje com o problema que esta oferta resolve?", "Existe alguma iniciativa relacionada prevista para este semestre?"],
         "suggested_message": f"Olá, gostaria de entender como a equipe de vocês aborda esse tema. Trabalhamos com {offer.get('name', 'uma solução nessa área')} e posso compartilhar algumas ideias se for relevante.",
         "caveat": "A aderência ao ICP não comprova uma necessidade de compra. Confirme as hipóteses em conversa.",
     }
-    if not settings.openrouter_api_key:
-        return fallback, "heuristic"
     request = {
         "instructions": [
             "Crie um brief curto para apoiar uma abordagem comercial B2B individual.",
@@ -89,20 +123,9 @@ async def generate_account_brief(offer: dict, account: dict, signals: list[dict]
         "schema_example": fallback,
         "offer": offer,
         "account": account,
+        "approved_icp": icp or {},
+        "score": score,
         "signals": signals,
     }
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(45.0)) as client:
-            response = await client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {settings.openrouter_api_key}", "Content-Type": "application/json"},
-                json={"model": settings.openrouter_model, "messages": [{"role": "user", "content": json.dumps(request, ensure_ascii=False)}], "response_format": {"type": "json_object"}, "temperature": 0.2},
-            )
-            response.raise_for_status()
-            payload = response.json()
-            brief = json.loads(payload["choices"][0]["message"]["content"])
-            if not isinstance(brief, dict) or not {"observed_signals", "unknowns", "suggested_message"}.issubset(brief):
-                raise ValueError("Formato de brief inválido")
-            return brief, settings.openrouter_model
-    except (httpx.HTTPError, KeyError, IndexError, json.JSONDecodeError, ValueError, TypeError):
-        return fallback, "heuristic_fallback"
+    brief, model = await _complete_json(request, lambda result: {"observed_signals", "unknowns", "suggested_message"}.issubset(result), trace)
+    return (brief or fallback), model
